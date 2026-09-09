@@ -196,6 +196,15 @@ def apply_physical_slicing(
     Dispatches physical slicing to the appropriate module architecture:
     SigLIP (mlp.fc1/fc2), Gemma 2 (mlp.gate_proj/up_proj/down_proj), or generic.
     """
+    # Direct inspection if the block itself is an MLP module
+    if hasattr(layer_block, "gate_proj") and hasattr(layer_block, "down_proj"):
+        slice_gemma_swiglu(layer_block, indices)
+        return layer_block
+    if hasattr(layer_block, "fc1") and hasattr(layer_block, "fc2"):
+        slice_siglip_mlp(layer_block, indices)
+        return layer_block
+
+    # Inspection if the block is a parent layer containing an .mlp submodule
     if hasattr(layer_block, "mlp"):
         mlp = layer_block.mlp
         if hasattr(mlp, "gate_proj") and hasattr(mlp, "down_proj"):
