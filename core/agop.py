@@ -1,5 +1,5 @@
 import logging
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -126,7 +126,7 @@ def compute_sample_score(
 
     elif score_mode == "last_token_logit":
         logits = outputs.logits if hasattr(outputs, "logits") else outputs
-        return logits[:, -1, :].max()
+        return logits[:, -1, :].max(dim=-1).values.sum()
 
     else:
         raise ValueError(f"Unsupported score_mode: '{score_mode}'")
