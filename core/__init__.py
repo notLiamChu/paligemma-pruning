@@ -8,11 +8,9 @@ from core.agop import (
 from core.surgery import (
     find_k_from_energy_threshold,
     extract_eigen_coordinates,
-    extract_deletion_coordinates,
     slice_siglip_mlp,
     slice_gemma_swiglu,
     apply_physical_slicing,
-    perform_agop_deletion_surgery,
     perform_agop_eigen_surgery,
 )
 from core.recovery import (
@@ -28,11 +26,9 @@ __all__ = [
     "compute_sample_score",
     "find_k_from_energy_threshold",
     "extract_eigen_coordinates",
-    "extract_deletion_coordinates",
     "slice_siglip_mlp",
     "slice_gemma_swiglu",
     "apply_physical_slicing",
-    "perform_agop_deletion_surgery",
     "perform_agop_eigen_surgery",
     "MultimodalDistillationLoss",
     "run_recovery_epochs",
