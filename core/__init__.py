@@ -15,6 +15,8 @@ from core.surgery import (
 )
 from core.recovery import (
     MultimodalDistillationLoss,
+    adapt_teacher_to_task,
+    cache_teacher_logits,
     run_recovery_epochs,
 )
 
@@ -31,5 +33,7 @@ __all__ = [
     "apply_physical_slicing",
     "perform_agop_eigen_surgery",
     "MultimodalDistillationLoss",
+    "adapt_teacher_to_task",
+    "cache_teacher_logits",
     "run_recovery_epochs",
 ]
