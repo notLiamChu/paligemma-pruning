@@ -2,6 +2,7 @@ import gc
 import copy
 import argparse
 import logging
+from typing import Dict, Optional
 import yaml
 import torch
 from torch.utils.data import DataLoader
@@ -27,6 +28,59 @@ def parse_args():
     return parser.parse_args()
 
 
+def evaluate_segmentation_performance(
+    model: torch.nn.Module,
+    val_loader: DataLoader,
+    processor: any,
+    evaluator: SegmentationEvaluator,
+    device: torch.device,
+    max_batches: Optional[int] = 15,
+) -> Dict[str, float]:
+    """
+    Evaluates grounding and segmentation mIoU across validation image-expression pairs.
+    """
+    model.eval()
+    pred_texts = []
+    gt_texts = []
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            if max_batches is not None and batch_idx >= max_batches:
+                break
+
+            batch_device = {
+                k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+
+            gen_kwargs = {
+                "input_ids": batch_device["input_ids"],
+                "max_new_tokens": 48,
+                "do_sample": False,
+            }
+            if "attention_mask" in batch_device:
+                gen_kwargs["attention_mask"] = batch_device["attention_mask"]
+            if "pixel_values" in batch_device:
+                gen_kwargs["pixel_values"] = batch_device["pixel_values"]
+
+            generated_ids = model.generate(**gen_kwargs)
+
+            # Strip image prefix and prompt token IDs to isolate generated response
+            prompt_len = batch_device["input_ids"].shape[1]
+            response_ids = generated_ids[:, prompt_len:]
+            preds = processor.batch_decode(response_ids, skip_special_tokens=False)
+
+            # Reconstruct ground truth target strings
+            labels = batch_device["labels"].clone()
+            labels[labels == -100] = processor.tokenizer.pad_token_id
+            gts = processor.batch_decode(labels, skip_special_tokens=True)
+
+            pred_texts.extend(preds)
+            gt_texts.extend(gts)
+
+    return evaluator.evaluate_batch_predictions(pred_texts, gt_texts)
+
+
 def main():
     args = parse_args()
     with open(args.config, "r", encoding="utf-8") as f:
@@ -46,7 +100,7 @@ def main():
         eval_mode=False,
     )
 
-    # 2. Build RefCOCO DataLoaders (Train and Val)
+    # 2. Build RefCOCO DataLoaders (Deterministic ordering for offline distillation)
     train_loader, val_loader = build_refcoco_dataloaders(
         processor=processor,
         batch_size=config["data"]["batch_size"],
@@ -55,6 +109,7 @@ def main():
         max_length=config["data"]["max_length"],
         image_size=config["data"]["image_size"],
         hf_dataset_id=config["data"].get("hf_dataset_id", "lmms-lab/RefCOCO"),
+        shuffle_train=False,
     )
 
     evaluator = SegmentationEvaluator(processor=processor)
@@ -69,6 +124,19 @@ def main():
             lr=config["teacher_adaptation"]["learning_rate"],
             weight_decay=config["teacher_adaptation"]["weight_decay"],
         )
+
+    logger.info("Evaluating Teacher baseline performance...")
+    teacher_metrics = evaluate_segmentation_performance(
+        model=teacher_model,
+        val_loader=val_loader,
+        processor=processor,
+        evaluator=evaluator,
+        device=device,
+    )
+    logger.info(
+        f"Teacher Baseline -> mIoU: {teacher_metrics['mean_iou']:.4f} | "
+        f"Sequence Accuracy: {teacher_metrics['sequence_accuracy'] * 100:.2f}%"
+    )
 
     # 4. Clone Mutable Student from Adapted Teacher
     student_model = copy.deepcopy(teacher_model)
@@ -88,7 +156,6 @@ def main():
             device=device,
             cache_path=cache_file,
         )
-        # Evict teacher from GPU memory
         logger.info("Evicting teacher model from GPU VRAM to reclaim memory...")
         del teacher_model
         gc.collect()
@@ -128,6 +195,19 @@ def main():
     profile_after = inspect_paligemma_architecture(student_model)
     print_architecture_report(profile_after)
 
+    # Benchmark raw post-pruning degradation before recovery distillation
+    raw_pruned_metrics = evaluate_segmentation_performance(
+        model=student_model,
+        val_loader=val_loader,
+        processor=processor,
+        evaluator=evaluator,
+        device=device,
+    )
+    logger.info(
+        f"Post-Surgery (Pre-Recovery) -> mIoU: {raw_pruned_metrics['mean_iou']:.4f} | "
+        f"Sequence Accuracy: {raw_pruned_metrics['sequence_accuracy'] * 100:.2f}%"
+    )
+
     # 7. Freeze Language Model; Train Pruned Vision Parameters and Projector
     for p in student_model.language_model.parameters():
         p.requires_grad = False
@@ -137,9 +217,20 @@ def main():
         for p in student_model.multi_modal_projector.parameters():
             p.requires_grad = True
 
-    # 8. Micro-Recovery Distillation using Offline Teacher Logits (0 GB Teacher GPU Overhead)
+    # 8. Micro-Recovery Distillation using Offline Teacher Logits
+    def eval_callback(model_instance: torch.nn.Module) -> float:
+        res = evaluate_segmentation_performance(
+            model=model_instance,
+            val_loader=val_loader,
+            processor=processor,
+            evaluator=evaluator,
+            device=device,
+            max_batches=10,
+        )
+        return res["mean_iou"]
+
     logger.info("Starting micro-recovery distillation on pruned vision parameters...")
-    run_recovery_epochs(
+    best_iou, best_state = run_recovery_epochs(
         student_model=student_model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -151,6 +242,21 @@ def main():
         weight_decay=config["distillation"]["weight_decay"],
         alpha=config["distillation"]["alpha"],
         temperature=config["distillation"]["temperature"],
+        eval_fn=eval_callback,
+    )
+
+    student_model.load_state_dict(best_state)
+
+    final_metrics = evaluate_segmentation_performance(
+        model=student_model,
+        val_loader=val_loader,
+        processor=processor,
+        evaluator=evaluator,
+        device=device,
+    )
+    logger.info(
+        f"\nFinal Recovered Student -> mIoU: {final_metrics['mean_iou']:.4f} | "
+        f"Sequence Accuracy: {final_metrics['sequence_accuracy'] * 100:.2f}%"
     )
 
     # 9. Serialize Pruned Checkpoint & Manifest
@@ -166,6 +272,9 @@ def main():
             "energy_threshold_tau": tau,
             "eigen_coordinate_sigma": sigma,
             "vision_pruned_params": profile_before.vision_mlp_params - profile_after.vision_mlp_params,
+            "teacher_miou": teacher_metrics["mean_iou"],
+            "post_surgery_miou": raw_pruned_metrics["mean_iou"],
+            "recovered_miou": final_metrics["mean_iou"],
         },
     )
     logger.info(f"Experiment 1 complete. Physically sliced checkpoint saved to: {out_dir}")
