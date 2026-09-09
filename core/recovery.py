@@ -118,9 +118,14 @@ def run_recovery_epochs(
         pbar = tqdm(train_loader, desc=f"Recovery Epoch {epoch + 1}/{epochs}")
 
         for batch in pbar:
+            if isinstance(batch, (list, tuple)):
+                batch_dict = {"input_ids": batch[0], "labels": batch[1]}
+            else:
+                batch_dict = batch
+
             batch_device = {
                 k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
-                for k, v in batch.items()
+                for k, v in batch_dict.items()
             }
 
             optimizer.zero_grad()
