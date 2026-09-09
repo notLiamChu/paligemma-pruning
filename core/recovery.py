@@ -244,9 +244,13 @@ def run_recovery_epochs(
             if metric_val > best_metric:
                 best_metric = metric_val
                 best_state = copy.deepcopy(student_model.state_dict())
-
+    
             if target_metric is not None and metric_val >= target_metric:
                 logger.info(f"Target metric threshold {target_metric} reached. Early stopping.")
                 break
-
+    
+    # Ensure that without an explicit eval_fn, the trained student weights are preserved
+    if eval_fn is None:
+        best_state = copy.deepcopy(student_model.state_dict())
+    
     return best_metric, best_state
