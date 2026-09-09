@@ -1,32 +1,46 @@
 experiment:
-  name: "exp1_siglip_vision_pruning"
-  description: "Structured AGOP physical channel pruning on SigLIP vision tower MLPs"
+name: "exp1_siglip_vision_pruning"
+description: "Structured AGOP physical channel pruning on SigLIP vision tower MLPs with RefCOCO"
 
 model:
-  model_id: "google/paligemma2-3b-pt-224"
-  dtype: "bfloat16"
-  device: "cuda"
+model_id: "google/paligemma2-3b-pt-224"
+dtype: "bfloat16"
+device: "cuda"
 
-pruning:
-  target_components: "vision"
-  target_layers: null
-  energy_threshold: 0.85
-  eigen_coordinate_sigma: 0.95
-  agop_samples: 64
-  score_mode: "nll_loss"
-
-distillation:
-  epochs: 3
-  learning_rate: 2.0e-5
-  weight_decay: 0.01
-  alpha: 0.5
-  temperature: 2.0
-  max_grad_norm: 1.0
+teacher_adaptation:
+enabled: true                       # Warm up teacher on RefCOCO to align syntax before pruning
+epochs: 3
+learning_rate: 5.0e-5
+weight_decay: 0.01
 
 data:
-  batch_size: 2
-  max_length: 512
-  image_size: 224
+dataset_name: "refcoco"
+hf_dataset_id: "lmms-lab/RefCOCO"
+num_train_samples: 200              # O(100) sample adaptation & calibration set
+num_val_samples: 50
+batch_size: 2
+max_length: 512
+image_size: 224
+
+pruning:
+target_components: "vision"         # Prune only SigLIP encoder MLPs (mlp.fc1, mlp.fc2)
+target_layers: null                 # Null selects all 27 vision blocks
+energy_threshold: 0.85              # Cumulative eigenspectrum energy ratio (tau)
+eigen_coordinate_sigma: 0.95        # Principal subspace coordinate energy cutoff
+agop_samples: 64                    # Multimodal calibration instances
+score_mode: "nll_loss"              # Gradient sensitivity score function
+
+offline_distillation:
+cache_logits: true                  # Cache teacher outputs on CPU to evict teacher from VRAM
+cache_file: "checkpoints/exp1_teacher_logits.pt"
+
+distillation:
+epochs: 3
+learning_rate: 2.0e-5
+weight_decay: 0.01
+alpha: 0.5                          # CE vs KL divergence loss balance
+temperature: 2.0                    # Softmax distillation temperature
+max_grad_norm: 1.0
 
 output:
-  checkpoint_dir: "checkpoints/exp1_vision_pruned"
+checkpoint_dir: "checkpoints/exp1_vision_pruned"
