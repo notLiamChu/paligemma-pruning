@@ -223,6 +223,10 @@ def compute_agop_for_layer(
 
             batch_size = H.size(0)
 
+            # Rescale gradients if score was computed via standard mean-reduced task loss
+            if score_mode == "nll_loss":
+                grad_H = grad_H * batch_size
+
             # Process each sample's gradient trajectory
             for b in range(batch_size):
                 if processed_samples >= num_samples:
