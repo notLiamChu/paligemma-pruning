@@ -51,29 +51,45 @@ def evaluate_segmentation_performance(
             batch_device = {
                 k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                 for k, v in batch.items()
+                if isinstance(v, torch.Tensor)
             }
 
+            # Select prompt-only input IDs to prevent target suffix leakage during generation
+            if "prompt_input_ids" in batch:
+                eval_input_ids = batch["prompt_input_ids"].to(device, non_blocking=True)
+                eval_attn_mask = (
+                    batch["prompt_attention_mask"].to(device, non_blocking=True)
+                    if "prompt_attention_mask" in batch
+                    else None
+                )
+            else:
+                eval_input_ids = batch_device["input_ids"]
+                eval_attn_mask = batch_device.get("attention_mask")
+
             gen_kwargs = {
-                "input_ids": batch_device["input_ids"],
+                "input_ids": eval_input_ids,
                 "max_new_tokens": 48,
                 "do_sample": False,
             }
-            if "attention_mask" in batch_device:
-                gen_kwargs["attention_mask"] = batch_device["attention_mask"]
+            if eval_attn_mask is not None:
+                gen_kwargs["attention_mask"] = eval_attn_mask
             if "pixel_values" in batch_device:
                 gen_kwargs["pixel_values"] = batch_device["pixel_values"]
 
             generated_ids = model.generate(**gen_kwargs)
 
-            # Strip image prefix and prompt token IDs to isolate generated response
-            prompt_len = batch_device["input_ids"].shape[1]
+            # Strip prompt tokens to isolate newly generated tokens
+            prompt_len = eval_input_ids.shape[1]
             response_ids = generated_ids[:, prompt_len:]
-            preds = processor.batch_decode(response_ids, skip_special_tokens=False)
+            preds = processor.batch_decode(response_ids, skip_special_tokens=True)
 
-            # Reconstruct ground truth target strings
-            labels = batch_device["labels"].clone()
-            labels[labels == -100] = processor.tokenizer.pad_token_id
-            gts = processor.batch_decode(labels, skip_special_tokens=True)
+            # Extract ground truth target strings
+            if "suffix_text" in batch:
+                gts = batch["suffix_text"]
+            else:
+                labels = batch_device["labels"].clone()
+                labels[labels == -100] = processor.tokenizer.pad_token_id
+                gts = processor.batch_decode(labels, skip_special_tokens=True)
 
             pred_texts.extend(preds)
             gt_texts.extend(gts)
@@ -123,6 +139,7 @@ def main():
             epochs=config["teacher_adaptation"]["epochs"],
             lr=config["teacher_adaptation"]["learning_rate"],
             weight_decay=config["teacher_adaptation"]["weight_decay"],
+            freeze_language_decoder=config["teacher_adaptation"].get("freeze_language_decoder", True),
         )
 
     logger.info("Evaluating Teacher baseline performance...")
