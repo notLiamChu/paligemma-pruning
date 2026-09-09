@@ -126,9 +126,14 @@ def build_refcoco_dataloaders(
     max_length: int = 512,
     image_size: int = 224,
     hf_dataset_id: str = "lmms-lab/RefCOCO",
+    shuffle_train: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Constructs train and validation DataLoaders for RefCOCO segmentation.
+    
+    Args:
+        shuffle_train: Defaults to False to ensure exact index alignment between
+                       batches and offline cached teacher logits during distillation.
     """
     collator = PaliGemmaDataCollator(
         processor=processor,
@@ -150,7 +155,17 @@ def build_refcoco_dataloaders(
         image_size=image_size,
     )
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collator)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collator)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=batch_size,
+        shuffle=shuffle_train,
+        collate_fn=collator,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=collator,
+    )
 
     return train_loader, val_loader
