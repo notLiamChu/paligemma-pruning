@@ -1,42 +1,22 @@
-import os
+import gc
 import copy
 import argparse
 import logging
 import yaml
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
-from PIL import Image
+from torch.utils.data import DataLoader
 
 from models.loader import load_paligemma_model
 from models.inspector import inspect_paligemma_architecture, print_architecture_report
 from models.checkpointing import save_sliced_paligemma
 from core.agop import get_agop_targets, compute_agop_for_layer
 from core.surgery import find_k_from_energy_threshold, perform_agop_eigen_surgery
-from core.recovery import run_recovery_epochs
-from data.collator import PaliGemmaDataCollator
+from core.recovery import adapt_teacher_to_task, cache_teacher_logits, run_recovery_epochs
+from data.segmentation import build_refcoco_dataloaders
 from metrics.segmentation_eval import SegmentationEvaluator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
-
-
-class SyntheticMultimodalDataset(Dataset):
-    """Synthetic dataset providing synthetic image-query pairs for calibration and verification."""
-    def __init__(self, num_samples: int = 32, image_size: int = 224):
-        self.num_samples = num_samples
-        self.image_size = image_size
-
-    def __len__(self) -> int:
-        return self.num_samples
-
-    def __getitem__(self, idx: int) -> dict:
-        img = Image.new("RGB", (self.image_size, self.image_size), color=(idx * 7 % 255, 120, 200))
-        return {
-            "image": img,
-            "prompt": "segment foreground object",
-            "suffix": "<loc0120><loc0150><loc0800><loc0850><seg012><seg045>",
-        }
 
 
 def parse_args():
@@ -44,7 +24,6 @@ def parse_args():
     parser.add_argument("--config", type=str, default="configs/exp1_vision_only.yaml", help="Path to config YAML")
     parser.add_argument("--device", type=str, default=None, help="Target device override (e.g. 'cuda:0', 'cpu')")
     parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face authentication token")
-    parser.add_argument("--dry-run", action="store_true", help="Run with synthetic dataset for quick verification")
     return parser.parse_args()
 
 
@@ -58,53 +37,80 @@ def main():
     )
     logger.info(f"Initializing Experiment 1 on device: {device}")
 
-    # Load teacher model (unpruned reference)
+    # 1. Load Base PaliGemma Model
     teacher_model, processor = load_paligemma_model(
         model_id=config["model"]["model_id"],
         dtype=config["model"]["dtype"],
         device=device,
         hf_token=args.hf_token,
-        eval_mode=True,
+        eval_mode=False,
     )
-    teacher_model.eval()
 
-    # Create mutable student copy for pruning
+    # 2. Build RefCOCO DataLoaders (Train and Val)
+    train_loader, val_loader = build_refcoco_dataloaders(
+        processor=processor,
+        batch_size=config["data"]["batch_size"],
+        num_train_samples=config["data"]["num_train_samples"],
+        num_val_samples=config["data"]["num_val_samples"],
+        max_length=config["data"]["max_length"],
+        image_size=config["data"]["image_size"],
+        hf_dataset_id=config["data"].get("hf_dataset_id", "lmms-lab/RefCOCO"),
+    )
+
+    evaluator = SegmentationEvaluator(processor=processor)
+
+    # 3. Optional Teacher Task Adaptation (Warmup)
+    if config.get("teacher_adaptation", {}).get("enabled", True):
+        teacher_model = adapt_teacher_to_task(
+            teacher_model=teacher_model,
+            train_loader=train_loader,
+            device=device,
+            epochs=config["teacher_adaptation"]["epochs"],
+            lr=config["teacher_adaptation"]["learning_rate"],
+            weight_decay=config["teacher_adaptation"]["weight_decay"],
+        )
+
+    # 4. Clone Mutable Student from Adapted Teacher
     student_model = copy.deepcopy(teacher_model)
     student_model.train()
 
-    logger.info("Baseline architecture footprint:")
+    logger.info("\nBaseline architecture profile:")
     profile_before = inspect_paligemma_architecture(student_model)
     print_architecture_report(profile_before)
 
-    collator = PaliGemmaDataCollator(
-        processor=processor,
-        max_length=config["data"]["max_length"],
-        image_size=config["data"]["image_size"],
-    )
+    # 5. Offline Teacher Logit Caching
+    cached_teacher_logits = None
+    if config.get("offline_distillation", {}).get("cache_logits", True):
+        cache_file = config["offline_distillation"].get("cache_file")
+        cached_teacher_logits = cache_teacher_logits(
+            teacher_model=teacher_model,
+            train_loader=train_loader,
+            device=device,
+            cache_path=cache_file,
+        )
+        # Evict teacher from GPU memory
+        logger.info("Evicting teacher model from GPU VRAM to reclaim memory...")
+        del teacher_model
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    dataset = SyntheticMultimodalDataset(num_samples=config["pruning"]["agop_samples"])
-    calibration_loader = DataLoader(
-        dataset,
-        batch_size=config["data"]["batch_size"],
-        shuffle=False,
-        collate_fn=collator,
-    )
-
+    # 6. Execute AGOP Extraction and Channel Slicing on SigLIP Vision Layers
     specs = get_agop_targets(
         student_model,
         target_components=config["pruning"]["target_components"],
         target_layers=config["pruning"]["target_layers"],
     )
-    logger.info(f"Identified {len(specs)} target MLP layers in SigLIP vision encoder.")
+    logger.info(f"Targeting {len(specs)} SigLIP vision MLP blocks for AGOP surgery.")
 
     tau = config["pruning"]["energy_threshold"]
     sigma = config["pruning"]["eigen_coordinate_sigma"]
 
     for spec in specs:
-        logger.info(f"\n--- Processing {spec.name} ---")
+        logger.info(f"\n--- Extracting AGOP for {spec.name} ---")
         agop_mat, eigvals, n = compute_agop_for_layer(
             model=student_model,
-            data_loader=calibration_loader,
+            data_loader=train_loader,
             target_spec=spec,
             device=device,
             num_samples=config["pruning"]["agop_samples"],
@@ -113,16 +119,16 @@ def main():
 
         k = find_k_from_energy_threshold(eigvals, energy_threshold=tau)
         orig_d_ff = agop_mat.shape[0]
-        logger.info(f"Spectral cutoff: {orig_d_ff} -> k={k} channels (tau={tau})")
+        logger.info(f"Spectral energy cutoff: {orig_d_ff} -> k={k} channels (tau={tau})")
 
-        # Perform physical channel slicing
+        # In-place physical eigen surgery
         perform_agop_eigen_surgery(spec.parent_block, agop_mat, k=k, sigma=sigma)
 
-    logger.info("\nPost-surgery architecture footprint:")
+    logger.info("\nPost-surgery architecture profile:")
     profile_after = inspect_paligemma_architecture(student_model)
     print_architecture_report(profile_after)
 
-    # Freeze Gemma 2 language decoder; optimize only pruned vision encoder and projector
+    # 7. Freeze Language Model; Train Pruned Vision Parameters and Projector
     for p in student_model.language_model.parameters():
         p.requires_grad = False
     for p in student_model.vision_tower.parameters():
@@ -131,13 +137,15 @@ def main():
         for p in student_model.multi_modal_projector.parameters():
             p.requires_grad = True
 
-    logger.info("Initiating micro-recovery distillation on pruned vision parameters...")
+    # 8. Micro-Recovery Distillation using Offline Teacher Logits (0 GB Teacher GPU Overhead)
+    logger.info("Starting micro-recovery distillation on pruned vision parameters...")
     run_recovery_epochs(
         student_model=student_model,
-        train_loader=calibration_loader,
-        val_loader=None,
+        train_loader=train_loader,
+        val_loader=val_loader,
         device=device,
-        teacher_model=teacher_model,
+        teacher_model=None,
+        cached_teacher_logits=cached_teacher_logits,
         epochs=config["distillation"]["epochs"],
         lr=config["distillation"]["learning_rate"],
         weight_decay=config["distillation"]["weight_decay"],
@@ -145,6 +153,7 @@ def main():
         temperature=config["distillation"]["temperature"],
     )
 
+    # 9. Serialize Pruned Checkpoint & Manifest
     out_dir = config["output"]["checkpoint_dir"]
     save_sliced_paligemma(
         model=student_model,
@@ -153,12 +162,13 @@ def main():
         base_model_id=config["model"]["model_id"],
         metadata={
             "experiment": config["experiment"]["name"],
+            "dataset": config["data"]["dataset_name"],
             "energy_threshold_tau": tau,
             "eigen_coordinate_sigma": sigma,
             "vision_pruned_params": profile_before.vision_mlp_params - profile_after.vision_mlp_params,
         },
     )
-    logger.info(f"Experiment 1 complete. Sliced checkpoint serialized to: {out_dir}")
+    logger.info(f"Experiment 1 complete. Physically sliced checkpoint saved to: {out_dir}")
 
 
 if __name__ == "__main__":
