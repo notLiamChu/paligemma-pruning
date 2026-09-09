@@ -12,6 +12,7 @@ enabled: true                       # Warm up teacher on RefCOCO to align syntax
 epochs: 3
 learning_rate: 5.0e-5
 weight_decay: 0.01
+freeze_language_decoder: true       # Freeze Gemma 2 decoder during warmup to save ~13 GB VRAM
 
 data:
 dataset_name: "refcoco"
